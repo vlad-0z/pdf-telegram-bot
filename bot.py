@@ -292,11 +292,11 @@ def main():
         entry_points=[CommandHandler("start", start), MessageHandler(filters.ATTACHMENT, direct_file_handler)],
         states={
             CHOOSE_ACTION: [
-               CallbackQueryHandler(ask_split_mode, pattern="^split$"),
-               CallbackQueryHandler(ask_for_combine_files, pattern="^combine$"),
-               CallbackQueryHandler(ask_for_assembly_common_file, pattern="^assembly$"),
-               # Добавляем наш "умный" обработчик сюда тоже
-               MessageHandler(filters.ATTACHMENT, direct_file_handler)
+            CallbackQueryHandler(ask_split_mode, pattern="^split$"),
+            CallbackQueryHandler(ask_for_combine_files, pattern="^combine$"),
+            CallbackQueryHandler(ask_for_assembly_common_file, pattern="^assembly$"),
+            # Добавляем наш "умный" обработчик сюда тоже
+            MessageHandler(filters.ATTACHMENT, direct_file_handler)
             ],
             CHOOSE_SPLIT_MODE: [CallbackQueryHandler(handle_split_choice, pattern="^split_")],
             AWAIT_SPLIT_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_split_order)],
@@ -327,5 +327,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
