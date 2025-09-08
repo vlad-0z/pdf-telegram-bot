@@ -75,7 +75,10 @@ async def end_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def direct_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Точка входа, если пользователь сразу отправляет файл(ы)."""
-    attachments = update.message.effective_attachment
+    # Делаем так, чтобы attachments всегда был списком, вне зависимости от того,
+    # как был отправлен файл (напрямую, пересылкой, группой).
+    raw_attachments = update.message.effective_attachment
+    attachments = list(raw_attachments) if isinstance(raw_attachments, tuple) else [raw_attachments]
     
     # Проверяем, что все отправленные файлы - это PDF.
     if not attachments or not all(hasattr(doc, 'mime_type') and doc.mime_type == 'application/pdf' for doc in attachments):
@@ -322,3 +325,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
