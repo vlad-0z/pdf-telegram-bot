@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 # --- Состояния ---
 CHOOSE_ACTION, CHOOSE_SPLIT_MODE, AWAIT_SPLIT_FILE, AWAIT_SPLIT_ORDER, \
-AWAIT_COMBINE_FILES, AWAIT_ASSEMBLY_COMMON, AWAIT_ASSEMBLY_UNIQUE, \
-CHOOSE_GROUP_ACTION, AWAIT_GROUP_SPLIT_CHOICE = range(9)
+AWAIT_COMBINE_FILES, AWAIT_ASSEMBLY_COMMON, AWAIT_ASSEMBLY_UNIQUE = range(7)
+
 
 # --- Вспомогательная функция для Markdown ---
 def escape_markdown_v2(text: str) -> str:
@@ -38,19 +38,13 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("➕ Собрать с общим файлом", callback_data="assembly")],
 ])
 
-GROUP_ACTION_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🖇️ Объединить все в один файл", callback_data="group_combine")],
-    [InlineKeyboardButton("🪓 Разбить каждый файл по отдельности", callback_data="group_split")],
-    [InlineKeyboardButton("« Отмена", callback_data="main_menu")],
-])
-
 SPLIT_MODE_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("По одному листу", callback_data="split_single"), InlineKeyboardButton("По два листа", callback_data="split_double")],
     [InlineKeyboardButton("Указать свой порядок", callback_data="split_custom")],
     [InlineKeyboardButton("« Отмена", callback_data="main_menu")],
 ])
 
-# --- Глобальный словарь для медиагрупп ---
+# --- Глобальный словарь для медиагрупп (оставим на будущее) ---
 media_group_files = defaultdict(list)
 
 # --- ОСНОВНЫЕ ФУНКЦИИ ДИАЛОГА ---
@@ -74,75 +68,39 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return CHOOSE_ACTION
 
-# --- ИЗМЕНЕНИЕ №1: Ключевое исправление. Функция теперь не убивает диалог, а возвращает в начало ---
-async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str = "Готово! Все части файла отправлены.") -> int:
-    """Очищает user_data и возвращает пользователя в главное меню, сохраняя диалог активным."""
+async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str) -> int:
+    """Завершает операцию и возвращает в главное меню."""
     context.user_data.clear()
     chat_id = update.effective_chat.id
     if update.callback_query:
         await update.callback_query.answer()
     
-    # Отправляем финальное сообщение
     await context.bot.send_message(chat_id=chat_id, text=message)
     
-    # Отправляем новое сообщение с главным меню
     await context.bot.send_message(
         chat_id=chat_id,
         text="Чем еще могу помочь?",
         reply_markup=MAIN_KEYBOARD
     )
-    # Возвращаемся в начальное состояние, а не завершаем диалог
     return CHOOSE_ACTION
 
 # --- ЛОГИКА "БЫСТРЫХ СЦЕНАРИЕВ" ---
-# ... (Эта часть остается без изменений, она работала корректно)
-async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.data
-    media_group_id = job_data['media_group_id']
-    chat_id = job_data['chat_id']
-    
-    files = media_group_files.pop(media_group_id, [])
-    pdf_files = [f for f in files if f.mime_type == 'application/pdf']
-    if not pdf_files: return
-
-    context.chat_data[chat_id] = {'files_to_process': pdf_files}
-    
-    if len(pdf_files) > 1:
-        await context.bot.send_message(
-            chat_id,
-            f"Я получила {len(pdf_files)} PDF файла(ов). Что вы хотите с ними сделать?",
-            reply_markup=GROUP_ACTION_KEYBOARD
-        )
-    # Если в группе был всего один файл, его обработает `document_shortcut_handler`
-    # поэтому здесь не нужно дублировать логику
 
 async def document_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.media_group_id:
-        media_group_id = update.message.media_group_id
-        media_group_files[media_group_id].append(update.message.document)
-        jobs = context.job_queue.get_jobs_by_name(str(media_group_id))
-        for job in jobs: job.schedule_removal()
-        context.job_queue.run_once(
-            process_media_group,
-            when=1.5,
-            data={'media_group_id': media_group_id, 'chat_id': update.effective_chat.id},
-            name=str(media_group_id)
-        )
-        return # Важно не возвращать состояние, т.к. работа уйдет в job_queue
-    else:
-        document = update.message.document
-        if document.mime_type != 'application/pdf':
-            await update.message.reply_text("Это не PDF-файл. Пожалуйста, отправьте мне документ в формате PDF.")
-            return CHOOSE_ACTION
+    """Обработчик для PDF-файла, отправленного вне диалога."""
+    document = update.message.document
+    if document.mime_type != 'application/pdf':
+        await update.message.reply_text("Это не PDF-файл. Пожалуйста, отправьте мне документ в формате PDF.")
+        return CHOOSE_ACTION
 
-        context.user_data['file_to_split'] = document
-        safe_filename = escape_markdown_v2(document.file_name)
-        await update.message.reply_text(
-            f"Я получила файл `{safe_filename}`\nКак именно вы хотите его разбить?",
-            reply_markup=SPLIT_MODE_KEYBOARD,
-            parse_mode='MarkdownV2'
-        )
-        return CHOOSE_SPLIT_MODE
+    context.user_data['file_to_split'] = document
+    safe_filename = escape_markdown_v2(document.file_name)
+    await update.message.reply_text(
+        f"Я получила файл `{safe_filename}`\nКак именно вы хотите его разбить?",
+        reply_markup=SPLIT_MODE_KEYBOARD,
+        parse_mode='MarkdownV2'
+    )
+    return CHOOSE_SPLIT_MODE
 
 # --- ЛОГИКА СЦЕНАРИЯ "РАЗБИТЬ PDF" ---
 
@@ -194,6 +152,7 @@ async def split_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE,
         document = update.message.document
         await update.message.reply_text("Файл принят. Начинаю обработку...")
 
+    final_message = "Готово! Все части файла отправлены."
     try:
         file = await context.bot.get_file(document.file_id)
         file_bytes = await file.download_as_bytearray()
@@ -224,19 +183,16 @@ async def split_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
             new_doc.close()
         pdf_doc.close()
-        final_message = "Готово! Все части файла отправлены."
 
     except Exception as e:
         logger.error(f"Ошибка при разбивке PDF: {e}")
         final_message = "К сожалению, при обработке файла произошла ошибка."
     
-    # --- ИЗМЕНЕНИЕ №2: Используем новую функцию для возврата в меню ---
     return await return_to_main_menu(update, context, message=final_message)
 
 
-# --- ЛОГИКА ОСТАЛЬНЫХ СЦЕНАРИЕВ (с аналогичными правками) ---
+# --- ОСТАЛЬНЫЕ СЦЕНАРИИ ---
 
-# ... Объединение ...
 async def ask_for_combine_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -288,7 +244,6 @@ async def combine_files_handler(update: Update, context: ContextTypes.DEFAULT_TY
         
     return await return_to_main_menu(update, context, message=final_message)
 
-# ... Сборка с общим файлом ...
 async def ask_for_assembly_common_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -356,8 +311,8 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            # ИЗМЕНЕНИЕ №3: Фильтр ~filters.State() теперь будет работать надежно
-            MessageHandler(filters.Document.PDF & filters.ChatType.PRIVATE & ~filters.State(CHOOSE_ACTION), document_shortcut_handler),
+            # ИСПРАВЛЕНО: Убран несуществующий фильтр filters.State
+            MessageHandler(filters.Document.PDF & filters.ChatType.PRIVATE, document_shortcut_handler),
         ],
         states={
             CHOOSE_ACTION: [
@@ -365,7 +320,11 @@ def main():
                 CallbackQueryHandler(ask_for_combine_files, pattern="^combine$"),
                 CallbackQueryHandler(ask_for_assembly_common_file, pattern="^assembly$"),
             ],
-            CHOOSE_SPLIT_MODE: [CallbackQueryHandler(handle_split_choice, pattern="^split_(single|double|custom)$")],
+            CHOOSE_SPLIT_MODE: [
+                CallbackQueryHandler(handle_split_choice, pattern="^split_(single|double|custom)$"),
+                # Добавим сюда возможность отмены на этом этапе
+                CallbackQueryHandler(main_menu, pattern="^main_menu$"),
+            ],
             AWAIT_SPLIT_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_split_order)],
             AWAIT_SPLIT_FILE: [MessageHandler(filters.Document.PDF, split_file_handler)],
             AWAIT_COMBINE_FILES: [
