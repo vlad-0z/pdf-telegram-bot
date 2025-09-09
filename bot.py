@@ -13,6 +13,7 @@ from telegram.ext import (
 )
 import fitz  # PyMuPDF
 from collections import defaultdict
+import asyncio
 
 # --- Настройка логирования для отладки на Render ---
 logging.basicConfig(
@@ -21,10 +22,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Определение состояний для ConversationHandler ---
-# --- ИЗМЕНЕНО: Добавлены новые состояния для обработки групповых операций ---
 CHOOSE_ACTION, CHOOSE_SPLIT_MODE, AWAIT_SPLIT_FILE, AWAIT_SPLIT_ORDER, \
 AWAIT_COMBINE_FILES, AWAIT_ASSEMBLY_COMMON, AWAIT_ASSEMBLY_UNIQUE, \
 CHOOSE_GROUP_ACTION, AWAIT_GROUP_SPLIT_CHOICE = range(9)
+
+# --- НОВЫЙ БЛОК: Функция для экранирования MarkdownV2 ---
+def escape_markdown_v2(text: str) -> str:
+    """Экранирует специальные символы для Telegram MarkdownV2."""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 # --- Клавиатуры ---
 MAIN_KEYBOARD = InlineKeyboardMarkup([
@@ -33,7 +39,6 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("➕ Собрать с общим файлом", callback_data="assembly")],
 ])
 
-# --- НОВЫЙ БЛОК: Клавиатуры для новых сценариев ---
 GROUP_ACTION_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🖇️ Объединить все в один файл", callback_data="group_combine")],
     [InlineKeyboardButton("🪓 Разбить каждый файл по отдельности", callback_data="group_split")],
@@ -43,17 +48,15 @@ GROUP_ACTION_KEYBOARD = InlineKeyboardMarkup([
 SPLIT_MODE_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("По одному листу", callback_data="split_single"), InlineKeyboardButton("По два листа", callback_data="split_double")],
     [InlineKeyboardButton("Указать свой порядок", callback_data="split_custom")],
-    [InlineKeyboardButton("« Назад в главное меню", callback_data="main_menu")],
+    [InlineKeyboardButton("« Отмена", callback_data="main_menu")], # Изменено на Отмена
 ])
 
 # Глобальный словарь для временного хранения файлов медиагрупп
-# Это нужно, чтобы собрать все файлы из одной группы перед обработкой
 media_group_files = defaultdict(list)
 
 # --- ОСНОВНЫЕ ФУНКЦИИ ДИАЛОГА ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Начало диалога, сброс состояния и показ главного меню."""
     context.user_data.clear()
     await update.message.reply_text(
         "Здравствуйте! Я ваш помощник для работы с PDF.\n\n"
@@ -63,7 +66,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return CHOOSE_ACTION
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Возвращает в главное меню."""
     context.user_data.clear()
     query = update.callback_query
     await query.answer()
@@ -74,9 +76,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return CHOOSE_ACTION
 
 async def end_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str = "Чем еще могу помочь?"):
-    """Завершает операцию и возвращает в главное меню."""
     context.user_data.clear()
-    # Определяем, откуда пришел вызов - из CallbackQuery или Message
     chat_id = update.effective_chat.id
     if update.callback_query:
         await update.callback_query.answer()
@@ -85,78 +85,170 @@ async def end_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, m
         text=message,
         reply_markup=MAIN_KEYBOARD
     )
-    return CHOOSE_ACTION
+    return ConversationHandler.END # Корректное завершение диалога
 
-# --- НОВЫЙ БЛОК: Логика для "быстрых сценариев" ---
-
-async def document_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Точка входа для любого отправленного документа.
-    Определяет, один файл или группа, и направляет на нужный сценарий.
-    """
-    # Если это часть медиагруппы
-    if update.message.media_group_id:
-        # Сохраняем информацию о файле
-        media_group_id = update.message.media_group_id
-        media_group_files[media_group_id].append(update.message.document)
-
-        # Удаляем предыдущее запланированное задание, если оно есть
-        jobs = context.job_queue.get_jobs_by_name(str(media_group_id))
-        for job in jobs:
-            job.schedule_removal()
-
-        # Запускаем отложенную задачу, чтобы дождаться всех файлов группы
-        context.job_queue.run_once(
-            process_media_group,
-            when=1,  # 1 секунда задержки
-            data={'media_group_id': media_group_id, 'chat_id': update.effective_chat.id},
-            name=str(media_group_id)
-        )
-        # Ничего не отвечаем пользователю, пока не соберем всю группу
-        return ConversationHandler.END # Временно выходим, ждем job
-
-    # Если это один файл
-    else:
-        document = update.message.document
-        if document.mime_type != 'application/pdf':
-            await update.message.reply_text("Ой, это не PDF-файл. Пожалуйста, отправьте мне документ именно в формате PDF.")
-            return CHOOSE_ACTION
-
-        # "Запоминаем" файл и сразу предлагаем его разбить
-        context.user_data['file_to_split'] = document
-        await update.message.reply_text(
-            f"Я получила файл `{document.file_name}`.\nКак именно вы хотите его разбить?",
-            reply_markup=SPLIT_MODE_KEYBOARD,
-            parse_mode='MarkdownV2'
-        )
-        return CHOOSE_SPLIT_MODE
+# --- ЛОГИКА "БЫСТРЫХ СЦЕНАРИЕВ" ---
 
 async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает собранную медиагруппу после небольшой задержки.
-    """
     job_data = context.job.data
     media_group_id = job_data['media_group_id']
     chat_id = job_data['chat_id']
     
     files = media_group_files.pop(media_group_id, [])
     
-    # Проверяем, что все файлы - PDF
     pdf_files = [f for f in files if f.mime_type == 'application/pdf']
     
-    if len(pdf_files) < 2: # Если PDF-файлов меньше двух
-        await context.bot.send_message(chat_id, "Для групповой операции нужно как минимум два PDF файла.")
+    if not pdf_files: return
+
+    if len(pdf_files) == 1:
+        # Если в итоге в группе оказался только один PDF, обрабатываем как одиночный файл
+        context.chat_data[chat_id] = {'file_to_split': pdf_files[0]}
+        safe_filename = escape_markdown_v2(pdf_files[0].file_name)
+        await context.bot.send_message(
+            chat_id,
+            f"Я получила файл `{safe_filename}`\nКак именно вы хотите его разбить?",
+            reply_markup=SPLIT_MODE_KEYBOARD,
+            parse_mode='MarkdownV2'
+        )
         return
 
-    # Сохраняем список файлов для дальнейшей обработки
-    context.chat_data[chat_id] = {'files_to_process': pdf_files}
+    if len(pdf_files) > 1:
+        context.chat_data[chat_id] = {'files_to_process': pdf_files}
+        await context.bot.send_message(
+            chat_id,
+            f"Я получила {len(pdf_files)} PDF файла(ов). Что вы хотите с ними сделать?",
+            reply_markup=GROUP_ACTION_KEYBOARD
+        )
+
+async def document_shortcut_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.media_group_id:
+        media_group_id = update.message.media_group_id
+        media_group_files[media_group_id].append(update.message.document)
+
+        jobs = context.job_queue.get_jobs_by_name(str(media_group_id))
+        for job in jobs:
+            job.schedule_removal()
+
+        context.job_queue.run_once(
+            process_media_group,
+            when=1.5,
+            data={'media_group_id': media_group_id, 'chat_id': update.effective_chat.id},
+            name=str(media_group_id)
+        )
+        return ConversationHandler.END
+    else:
+        document = update.message.document
+        if document.mime_type != 'application/pdf':
+            await update.message.reply_text("Это не PDF-файл. Пожалуйста, отправьте мне документ в формате PDF.")
+            return ConversationHandler.END
+
+        context.user_data['file_to_split'] = document
+        # ИСПРАВЛЕНО: Экранируем имя файла
+        safe_filename = escape_markdown_v2(document.file_name)
+        await update.message.reply_text(
+            f"Я получила файл `{safe_filename}`\nКак именно вы хотите его разбить?",
+            reply_markup=SPLIT_MODE_KEYBOARD,
+            parse_mode='MarkdownV2'
+        )
+        return CHOOSE_SPLIT_MODE
+
+# --- ЛОГИКА СЦЕНАРИЯ "РАЗБИТЬ PDF" ---
+
+async def ask_split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Отлично! Как именно вы хотите разбить PDF файл?", reply_markup=SPLIT_MODE_KEYBOARD)
+    return CHOOSE_SPLIT_MODE
+
+async def handle_split_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['split_mode'] = query.data
+
+    if 'file_to_split' in context.user_data and query.data != 'split_custom':
+        # Если файл уже есть и выбран простой режим, сразу разбиваем
+        return await split_file_handler(update, context, pre_saved=True)
     
-    await context.bot.send_message(
-        chat_id,
-        f"Я получила {len(pdf_files)} PDF файла(ов). Что вы хотите с ними сделать?",
-        reply_markup=GROUP_ACTION_KEYBOARD
-    )
-    # Эта функция выполняется вне ConversationHandler, поэтому мы не возвращаем состояние
+    if query.data == 'split_custom':
+        await query.edit_message_text(
+            "Хорошо. Отправьте порядок разбивки.\n\n"
+            "**Пример для 10 страниц:** `3,3,4`\n"
+            "Вы получите 3 файла: (1-3), (4-6), (7-10).\n\n"
+            "Отправьте числа через запятую.",
+            parse_mode="MarkdownV2"
+        )
+        return AWAIT_SPLIT_ORDER
+    else:
+        await query.edit_message_text("Поняла. Теперь просто отправьте мне PDF файл для разбивки.")
+        return AWAIT_SPLIT_FILE
+
+async def receive_split_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    order = update.message.text
+    if not re.match(r'^\d+(,\s*\d+)*$', order):
+        await update.message.reply_text("Формат неверный. Используйте только цифры и запятые. Например: `3,3,4`", parse_mode="MarkdownV2")
+        return AWAIT_SPLIT_ORDER
+        
+    context.user_data['custom_order'] = [int(x) for x in order.split(',')]
+    
+    if 'file_to_split' in context.user_data:
+        return await split_file_handler(update, context, pre_saved=True)
+    else:
+        await update.message.reply_text(f'Отлично, порядок "{order}" принят. Теперь отправьте PDF файл.')
+        return AWAIT_SPLIT_FILE
+
+async def split_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, pre_saved: bool = False) -> int:
+    if pre_saved:
+        document = context.user_data.get('file_to_split')
+        message_to_edit = update.callback_query.message if update.callback_query else update.message
+        await message_to_edit.edit_text("Файл уже есть. Начинаю обработку...")
+    else:
+        document = update.message.document
+        await update.message.reply_text("Файл принят. Начинаю обработку...")
+
+    try:
+        file = await context.bot.get_file(document.file_id)
+        file_bytes = await file.download_as_bytearray()
+        pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+        
+        # ... остальная логика без изменений ...
+        total_pages = pdf_doc.page_count
+        ranges, mode = [], context.user_data.get('split_mode')
+        if mode == 'split_single': ranges = [[i] for i in range(total_pages)]
+        elif mode == 'split_double':
+            ranges = [[i, i + 1] for i in range(0, total_pages, 2)]
+            if total_pages % 2 != 0: ranges[-1] = [total_pages - 1]
+        elif mode == 'split_custom':
+            order, current_page = context.user_data.get('custom_order', []), 0
+            for part_size in order:
+                if current_page >= total_pages: break
+                end_page = min(current_page + part_size, total_pages)
+                ranges.append(list(range(current_page, end_page)))
+                current_page = end_page
+        
+        if not ranges:
+            await context.bot.send_message(update.effective_chat.id, "Не удалось определить порядок страниц. Проверьте введенные данные.")
+            return await end_conversation(update, context)
+
+        base_name = os.path.splitext(document.file_name)[0]
+        for i, page_range in enumerate(ranges):
+            new_doc = fitz.open()
+            new_doc.insert_pdf(pdf_doc, from_page=page_range[0], to_page=page_range[-1])
+            output_bytes = new_doc.write()
+            if output_bytes:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=output_bytes,
+                    filename=f"{base_name}_part_{i + 1}.pdf"
+                )
+            new_doc.close()
+        pdf_doc.close()
+        final_message = "Готово! Все части файла отправлены."
+
+    except Exception as e:
+        logger.error(f"Ошибка при разбивке PDF: {e}")
+        final_message = "К сожалению, при обработке файла произошла ошибка. Возможно, он поврежден."
+    
+    return await end_conversation(update, context, message=final_message)
 
 # --- ЛОГИКА СЦЕНАРИЯ "РАЗБИТЬ PDF" ---
 
@@ -522,3 +614,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
