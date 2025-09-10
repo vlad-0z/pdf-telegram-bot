@@ -1,7 +1,7 @@
 import os
 import logging
 import re
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -13,7 +13,6 @@ from telegram.ext import (
 )
 import fitz  # PyMuPDF
 from collections import defaultdict
-from io import BytesIO
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -37,7 +36,6 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🪓 Разбить PDF файл", callback_data="split")],
     [InlineKeyboardButton("🖇️ Объединить несколько PDF", callback_data="combine")],
     [InlineKeyboardButton("➕ Собрать с общим файлом", callback_data="assembly")],
-    # НОВАЯ КНОПКА
     [InlineKeyboardButton("📄 PDF в Картинки", callback_data="pdf_to_img")],
 ])
 
@@ -83,7 +81,6 @@ async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     return CHOOSE_ACTION
 
 # --- ЛОГИКА ОБРАБОТКИ ФАЙЛОВ ---
-# ... (Этот блок без изменений) ...
 async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data; media_group_id, chat_id, user_id, action = job_data['media_group_id'], job_data['chat_id'], job_data['user_id'], job_data['action']
     documents = media_group_files.pop(media_group_id, [])
@@ -127,38 +124,29 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # --- НОВЫЙ БЛОК: ЛОГИКА "PDF В КАРТИНКИ" ---
 
 def parse_page_ranges(range_str: str, max_pages: int) -> list[int]:
-    """Парсит строку с диапазонами страниц (например, '1-3, 5, 8-10') в список номеров."""
-    if range_str.lower() == 'все':
-        return list(range(max_pages))
-    
+    if range_str.lower() == 'все': return list(range(max_pages))
     pages = set()
     try:
-        parts = range_str.split(',')
+        parts = range_str.split(',');
         for part in parts:
             part = part.strip()
             if '-' in part:
                 start, end = map(int, part.split('-'))
                 for i in range(start, end + 1):
-                    if 1 <= i <= max_pages:
-                        pages.add(i - 1) # Конвертируем в 0-индексацию
+                    if 1 <= i <= max_pages: pages.add(i - 1)
             else:
                 page_num = int(part)
-                if 1 <= page_num <= max_pages:
-                    pages.add(page_num - 1) # Конвертируем в 0-индексацию
-    except ValueError:
-        return [] # Возвращаем пустой список в случае ошибки парсинга
+                if 1 <= page_num <= max_pages: pages.add(page_num - 1)
+    except ValueError: return []
     return sorted(list(pages))
 
 async def ask_for_pdf_to_image_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Запускает сценарий 'PDF в Картинки'."""
-    query = update.callback_query
-    await query.answer()
+    query = update.callback_query; await query.answer()
     await query.edit_message_text("Хорошо. Отправь мне PDF-файл, который нужно превратить в изображения.")
     context.user_data['awaiting_file_for'] = 'pdf_to_img'
     return AWAIT_PDF_TO_IMAGE_FILE
 
 async def ask_for_page_range(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получает файл и спрашивает диапазон страниц."""
     document = update.message.document
     try:
         file = await context.bot.get_file(document.file_id)
@@ -171,23 +159,18 @@ async def ask_for_page_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data['pdf_base_name'] = base_name
 
         await update.message.reply_text(
-            f"Файл получен! В нем {pdf_doc.page_count} страниц.\n\n"
-            "Какие страницы преобразовать? Отправь `все` или укажи номера/диапазоны (например: `1-3, 5`).",
-            parse_mode='Markdown'
-        )
+            f"Файл получен! В нем {pdf_doc.page_count} страниц.\n\nКакие страницы преобразовать? Отправь `все` или укажи номера/диапазоны (например: `1-3, 5`).",
+            parse_mode='Markdown')
         pdf_doc.close()
         return AWAIT_PAGE_RANGE_FOR_IMAGE
-
     except Exception as e:
         logger.error(f"Ошибка при чтении PDF для конвертации в картинки: {e}")
         await update.message.reply_text("Не удалось прочитать этот PDF. Возможно, он поврежден.")
         return CHOOSE_ACTION
 
 async def pdf_to_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обрабатывает PDF и отправляет картинки."""
     page_range_str = update.message.text
     max_pages = context.user_data.get('pdf_page_count', 0)
-    
     page_indices = parse_page_ranges(page_range_str, max_pages)
     
     if not page_indices:
@@ -203,17 +186,15 @@ async def pdf_to_image_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         
         for page_index in page_indices:
             page = pdf_doc.load_page(page_index)
-            # Устанавливаем высокое качество (DPI)
             pix = page.get_pixmap(dpi=200)
             
-            # Сохраняем изображение в байтовый поток в памяти
+            # ИСПРАВЛЕНО: Генерируем байты и отправляем их напрямую, указывая filename
             img_bytes = pix.tobytes("png")
-            img_stream = BytesIO(img_bytes)
             
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
-                document=InputFile(img_stream),
-                filename=f"{base_name}_page_{page_index + 1}.png"
+                document=img_bytes, # Отправляем байты напрямую
+                filename=f"{base_name}_page_{page_index + 1}.png" # Указываем имя файла
             )
         pdf_doc.close()
         final_message = "Готово! Все страницы отправлены в виде картинок."
@@ -224,7 +205,7 @@ async def pdf_to_image_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     return await return_to_main_menu(update, context, message=final_message)
 
 
-# --- ОСТАЛЬНЫЕ СЦЕНАРИИ (код без изменений) ---
+# --- ОСТАЛЬНЫЕ СЦЕНАРИИ ---
 async def ask_split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
     await query.edit_message_text("Отлично! Как именно вы хотите разбить PDF файл?", reply_markup=SPLIT_MODE_KEYBOARD)
