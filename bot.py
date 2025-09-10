@@ -1,7 +1,7 @@
 import os
 import logging
 import re
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -13,6 +13,7 @@ from telegram.ext import (
 )
 import fitz  # PyMuPDF
 from collections import defaultdict
+from io import BytesIO
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -22,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 # --- Состояния ---
 CHOOSE_ACTION, CHOOSE_SPLIT_MODE, AWAIT_SPLIT_FILE, AWAIT_SPLIT_ORDER, \
-AWAIT_COMBINE_FILES, AWAIT_ASSEMBLY_COMMON, AWAIT_ASSEMBLY_UNIQUE = range(7)
+AWAIT_COMBINE_FILES, AWAIT_ASSEMBLY_COMMON, AWAIT_ASSEMBLY_UNIQUE, \
+AWAIT_PDF_TO_IMAGE_FILE, AWAIT_PAGE_RANGE_FOR_IMAGE = range(9)
 
 
 # --- Вспомогательная функция для Markdown ---
@@ -35,6 +37,8 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🪓 Разбить PDF файл", callback_data="split")],
     [InlineKeyboardButton("🖇️ Объединить несколько PDF", callback_data="combine")],
     [InlineKeyboardButton("➕ Собрать с общим файлом", callback_data="assembly")],
+    # НОВАЯ КНОПКА
+    [InlineKeyboardButton("📄 PDF в Картинки", callback_data="pdf_to_img")],
 ])
 
 SPLIT_MODE_KEYBOARD = InlineKeyboardMarkup([
@@ -79,14 +83,11 @@ async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     return CHOOSE_ACTION
 
 # --- ЛОГИКА ОБРАБОТКИ ФАЙЛОВ ---
-
+# ... (Этот блок без изменений) ...
 async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.data
-    media_group_id, chat_id, user_id, action = job_data['media_group_id'], job_data['chat_id'], job_data['user_id'], job_data['action']
-    
+    job_data = context.job.data; media_group_id, chat_id, user_id, action = job_data['media_group_id'], job_data['chat_id'], job_data['user_id'], job_data['action']
     documents = media_group_files.pop(media_group_id, [])
     if not documents: return
-
     user_data = context.application.user_data.get(user_id, {})
     if action in ['combine', 'assembly_unique']:
         if 'files_to_process' not in user_data: user_data['files_to_process'] = []
@@ -97,22 +98,16 @@ async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id, f"Я получила {len(documents)} файла(ов). Что с ними сделать?", reply_markup=GROUP_ACTION_KEYBOARD)
     context.application.user_data[user_id] = user_data
 
-
 async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message.media_group_id:
-        media_group_id = update.message.media_group_id
-        media_group_files[media_group_id].append(update.message.document)
+        media_group_id = update.message.media_group_id; media_group_files[media_group_id].append(update.message.document)
         expected_action = context.user_data.get('awaiting_file_for')
-        
         jobs = context.job_queue.get_jobs_by_name(str(media_group_id))
         for job in jobs: job.schedule_removal()
-        
         context.job_queue.run_once(
-            process_media_group,
-            when=1.5,
+            process_media_group, when=1.5,
             data={'media_group_id': media_group_id, 'chat_id': update.effective_chat.id, 'user_id': update.effective_user.id, 'action': expected_action},
-            name=str(media_group_id)
-        )
+            name=str(media_group_id))
         return context.conversation_state
     else:
         expected_action = context.user_data.pop('awaiting_file_for', None)
@@ -120,16 +115,116 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if expected_action == 'combine': return await receive_file_for_list(update, context, AWAIT_COMBINE_FILES)
         if expected_action == 'assembly_common': return await receive_assembly_common_file(update, context)
         if expected_action == 'assembly_unique': return await receive_file_for_list(update, context, AWAIT_ASSEMBLY_UNIQUE)
+        if expected_action == 'pdf_to_img': return await ask_for_page_range(update, context)
         else:
             document = update.message.document
             if document.mime_type != 'application/pdf':
                 await update.message.reply_text("Это не PDF-файл."); return CHOOSE_ACTION
-            context.user_data['file_to_split'] = document
-            safe_filename = escape_markdown_v2(document.file_name)
+            context.user_data['file_to_split'] = document; safe_filename = escape_markdown_v2(document.file_name)
             await update.message.reply_text(f"Я получила файл `{safe_filename}`\nКак именно вы хотите его разбить?", reply_markup=SPLIT_MODE_KEYBOARD, parse_mode='MarkdownV2')
             return CHOOSE_SPLIT_MODE
 
-# --- РАЗЛИЧНЫЕ СЦЕНАРИИ ---
+# --- НОВЫЙ БЛОК: ЛОГИКА "PDF В КАРТИНКИ" ---
+
+def parse_page_ranges(range_str: str, max_pages: int) -> list[int]:
+    """Парсит строку с диапазонами страниц (например, '1-3, 5, 8-10') в список номеров."""
+    if range_str.lower() == 'все':
+        return list(range(max_pages))
+    
+    pages = set()
+    try:
+        parts = range_str.split(',')
+        for part in parts:
+            part = part.strip()
+            if '-' in part:
+                start, end = map(int, part.split('-'))
+                for i in range(start, end + 1):
+                    if 1 <= i <= max_pages:
+                        pages.add(i - 1) # Конвертируем в 0-индексацию
+            else:
+                page_num = int(part)
+                if 1 <= page_num <= max_pages:
+                    pages.add(page_num - 1) # Конвертируем в 0-индексацию
+    except ValueError:
+        return [] # Возвращаем пустой список в случае ошибки парсинга
+    return sorted(list(pages))
+
+async def ask_for_pdf_to_image_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Запускает сценарий 'PDF в Картинки'."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Хорошо. Отправь мне PDF-файл, который нужно превратить в изображения.")
+    context.user_data['awaiting_file_for'] = 'pdf_to_img'
+    return AWAIT_PDF_TO_IMAGE_FILE
+
+async def ask_for_page_range(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получает файл и спрашивает диапазон страниц."""
+    document = update.message.document
+    try:
+        file = await context.bot.get_file(document.file_id)
+        file_bytes = await file.download_as_bytearray()
+        pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+        
+        context.user_data['pdf_file_bytes'] = file_bytes
+        context.user_data['pdf_page_count'] = pdf_doc.page_count
+        base_name = os.path.splitext(document.file_name)[0]
+        context.user_data['pdf_base_name'] = base_name
+
+        await update.message.reply_text(
+            f"Файл получен! В нем {pdf_doc.page_count} страниц.\n\n"
+            "Какие страницы преобразовать? Отправь `все` или укажи номера/диапазоны (например: `1-3, 5`).",
+            parse_mode='Markdown'
+        )
+        pdf_doc.close()
+        return AWAIT_PAGE_RANGE_FOR_IMAGE
+
+    except Exception as e:
+        logger.error(f"Ошибка при чтении PDF для конвертации в картинки: {e}")
+        await update.message.reply_text("Не удалось прочитать этот PDF. Возможно, он поврежден.")
+        return CHOOSE_ACTION
+
+async def pdf_to_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает PDF и отправляет картинки."""
+    page_range_str = update.message.text
+    max_pages = context.user_data.get('pdf_page_count', 0)
+    
+    page_indices = parse_page_ranges(page_range_str, max_pages)
+    
+    if not page_indices:
+        await update.message.reply_text("Не поняла диапазон. Попробуй еще раз. Например: `1-3, 5` или `все`.", parse_mode='Markdown')
+        return AWAIT_PAGE_RANGE_FOR_IMAGE
+        
+    await update.message.reply_text(f"Принято! Начинаю преобразование {len(page_indices)} страниц. Это может занять время...")
+    
+    try:
+        file_bytes = context.user_data.get('pdf_file_bytes')
+        base_name = context.user_data.get('pdf_base_name', 'document')
+        pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+        
+        for page_index in page_indices:
+            page = pdf_doc.load_page(page_index)
+            # Устанавливаем высокое качество (DPI)
+            pix = page.get_pixmap(dpi=200)
+            
+            # Сохраняем изображение в байтовый поток в памяти
+            img_bytes = pix.tobytes("png")
+            img_stream = BytesIO(img_bytes)
+            
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(img_stream),
+                filename=f"{base_name}_page_{page_index + 1}.png"
+            )
+        pdf_doc.close()
+        final_message = "Готово! Все страницы отправлены в виде картинок."
+    except Exception as e:
+        logger.error(f"Ошибка при конвертации PDF в картинки: {e}")
+        final_message = "Произошла ошибка во время преобразования. Попробуйте еще раз."
+        
+    return await return_to_main_menu(update, context, message=final_message)
+
+
+# --- ОСТАЛЬНЫЕ СЦЕНАРИИ (код без изменений) ---
 async def ask_split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
     await query.edit_message_text("Отлично! Как именно вы хотите разбить PDF файл?", reply_markup=SPLIT_MODE_KEYBOARD)
@@ -138,10 +233,7 @@ async def ask_split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_split_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
     context.user_data['split_mode'] = query.data
-
-    # ИСПРАВЛЕНО: Экранированы все спецсимволы: . ( )
     text_for_custom_order = "Хорошо\\. Отправьте порядок разбивки \\(например: `3,3,4`\\)"
-
     if 'file_to_split' in context.user_data:
         if query.data != 'split_custom':
             await query.edit_message_text("Поняла. Начинаю обработку...")
@@ -160,7 +252,6 @@ async def handle_split_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def receive_split_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     order = update.message.text
-    # ИСПРАВЛЕНО: Экранированы все спецсимволы: .
     error_text = "Формат неверный\\. Используйте только цифры и запятые\\. Например: `3,3,4`"
     if not re.match(r'^\d+(,\s*\d+)*$', order):
         await update.message.reply_text(error_text, parse_mode="MarkdownV2")
@@ -280,6 +371,7 @@ async def assembly_files_handler(update: Update, context: ContextTypes.DEFAULT_T
         logger.error(f"Ошибка при сборке PDF: {e}"); final_message = "К сожалению, при обработке одного из файлов произошла ошибка."
     return await return_to_main_menu(update, context, message=final_message)
 
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
 
@@ -298,10 +390,10 @@ def main():
                 CallbackQueryHandler(ask_split_mode, pattern="^split$"),
                 CallbackQueryHandler(ask_for_combine_files, pattern="^combine$"),
                 CallbackQueryHandler(ask_for_assembly_common_file, pattern="^assembly$"),
+                CallbackQueryHandler(ask_for_pdf_to_image_file, pattern="^pdf_to_img$"),
             ],
             CHOOSE_SPLIT_MODE: [
                 CallbackQueryHandler(handle_split_choice, pattern="^split_(single|double|custom)$"),
-                CallbackQueryHandler(main_menu, pattern="^main_menu$"),
             ],
             AWAIT_SPLIT_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_split_order)],
             AWAIT_SPLIT_FILE: [MessageHandler(filters.Document.PDF, document_router)],
@@ -314,6 +406,8 @@ def main():
                 MessageHandler(filters.Document.PDF, document_router),
                 CallbackQueryHandler(assembly_files_handler, pattern="^process_done$"),
             ],
+            AWAIT_PDF_TO_IMAGE_FILE: [MessageHandler(filters.Document.PDF, document_router)],
+            AWAIT_PAGE_RANGE_FOR_IMAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, pdf_to_image_handler)],
         },
         fallbacks=[CommandHandler("start", start), CallbackQueryHandler(main_menu, pattern="^main_menu$")],
         allow_reentry=True
