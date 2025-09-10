@@ -68,6 +68,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.edit_message_text("Выберите, что вы хотите сделать:", reply_markup=MAIN_KEYBOARD)
     return CHOOSE_ACTION
 
+# ИСПРАВЛЕНИЕ: Ключевое изменение логики завершения.
 async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str) -> int:
     """Завершает операцию и корректно возвращает в главное меню, сохраняя диалог активным."""
     context.user_data.clear()
@@ -77,6 +78,7 @@ async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await context.bot.send_message(chat_id=chat_id, text=message)
     await context.bot.send_message(chat_id=chat_id, text="Чем еще могу помочь?", reply_markup=MAIN_KEYBOARD)
+    # Возвращаемся в начальное состояние, а не убиваем диалог
     return CHOOSE_ACTION
 
 # --- ЛОГИКА ОБРАБОТКИ ФАЙЛОВ ---
@@ -296,7 +298,11 @@ def main():
                 CallbackQueryHandler(ask_for_combine_files, pattern="^combine$"),
                 CallbackQueryHandler(ask_for_assembly_common_file, pattern="^assembly$"),
             ],
-            CHOOSE_SPLIT_MODE: [CallbackQueryHandler(handle_split_choice, pattern="^split_(single|double|custom)$")],
+            # ИСПРАВЛЕНИЕ: Добавляем сюда явный обработчик кнопки "Отмена" для надежности
+            CHOOSE_SPLIT_MODE: [
+                CallbackQueryHandler(handle_split_choice, pattern="^split_(single|double|custom)$"),
+                CallbackQueryHandler(main_menu, pattern="^main_menu$"),
+            ],
             AWAIT_SPLIT_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_split_order)],
             AWAIT_SPLIT_FILE: [MessageHandler(filters.Document.PDF, document_router)],
             AWAIT_COMBINE_FILES: [
