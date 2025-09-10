@@ -74,7 +74,8 @@ async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.callback_query:
         await update.callback_query.answer()
     
-    await context.bot.send_message(chat_id=chat_id, text=message)
+    # Экранируем сообщение перед отправкой в MarkdownV2
+    await context.bot.send_message(chat_id=chat_id, text=escape_markdown_v2(message), parse_mode='MarkdownV2')
     await context.bot.send_message(chat_id=chat_id, text="Чем еще могу помочь?", reply_markup=MAIN_KEYBOARD)
     return CHOOSE_ACTION
 
@@ -85,11 +86,13 @@ async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
     media_group_id, chat_id, user_id, action = job_data['media_group_id'], job_data['chat_id'], job_data['user_id'], job_data['action']
     
     documents = media_group_files.pop(media_group_id, [])
-    if not documents: return
+    if not documents:
+        return
 
     user_data = context.application.user_data.get(user_id, {})
     if action in ['combine', 'assembly_unique']:
-        if 'files_to_process' not in user_data: user_data['files_to_process'] = []
+        if 'files_to_process' not in user_data:
+            user_data['files_to_process'] = []
         user_data['files_to_process'].extend(documents)
         await context.bot.send_message(chat_id, f"Добавлено {len(documents)} файла(ов). Всего в списке: {len(user_data['files_to_process'])}.")
     else:
@@ -105,7 +108,8 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         expected_action = context.user_data.get('awaiting_file_for')
         
         jobs = context.job_queue.get_jobs_by_name(str(media_group_id))
-        for job in jobs: job.schedule_removal()
+        for job in jobs:
+            job.schedule_removal()
         
         context.job_queue.run_once(
             process_media_group,
@@ -116,31 +120,42 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return context.conversation_state
     else:
         expected_action = context.user_data.pop('awaiting_file_for', None)
-        if expected_action == 'split': return await split_file_handler(update, context)
-        if expected_action == 'combine': return await receive_file_for_list(update, context, AWAIT_COMBINE_FILES)
-        if expected_action == 'assembly_common': return await receive_assembly_common_file(update, context)
-        if expected_action == 'assembly_unique': return await receive_file_for_list(update, context, AWAIT_ASSEMBLY_UNIQUE)
+        if expected_action == 'split':
+            return await split_file_handler(update, context)
+        if expected_action == 'combine':
+            return await receive_file_for_list(update, context, AWAIT_COMBINE_FILES)
+        if expected_action == 'assembly_common':
+            return await receive_assembly_common_file(update, context)
+        if expected_action == 'assembly_unique':
+            return await receive_file_for_list(update, context, AWAIT_ASSEMBLY_UNIQUE)
         else:
             document = update.message.document
             if document.mime_type != 'application/pdf':
-                await update.message.reply_text("Это не PDF-файл."); return CHOOSE_ACTION
+                await update.message.reply_text("Это не PDF-файл.")
+                return CHOOSE_ACTION
             context.user_data['file_to_split'] = document
             safe_filename = escape_markdown_v2(document.file_name)
-            await update.message.reply_text(f"Я получила файл `{safe_filename}`\nКак именно вы хотите его разбить?", reply_markup=SPLIT_MODE_KEYBOARD, parse_mode='MarkdownV2')
+            await update.message.reply_text(
+                f"Я получила файл `{safe_filename}`\nКак именно вы хотите его разбить?",
+                reply_markup=SPLIT_MODE_KEYBOARD,
+                parse_mode='MarkdownV2'
+            )
             return CHOOSE_SPLIT_MODE
 
 # --- РАЗЛИЧНЫЕ СЦЕНАРИИ ---
 async def ask_split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer()
+    query = update.callback_query
+    await query.answer()
     await query.edit_message_text("Отлично! Как именно вы хотите разбить PDF файл?", reply_markup=SPLIT_MODE_KEYBOARD)
     return CHOOSE_SPLIT_MODE
 
 async def handle_split_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer()
+    query = update.callback_query
+    await query.answer()
     context.user_data['split_mode'] = query.data
 
-    # ИСПРАВЛЕНО: Добавлен обратный слэш для экранирования точки.
-    text_for_custom_order = "Хорошо\\. Отправьте порядок разбивки (например: `3,3,4`)"
+    # Экранированный текст для MarkdownV2
+    text_for_custom_order = "Хорошо\\. Отправьте порядок разбивки \\(например: \\`3,3,4\\`\\)"
 
     if 'file_to_split' in context.user_data:
         if query.data != 'split_custom':
@@ -160,8 +175,7 @@ async def handle_split_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def receive_split_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     order = update.message.text
-    # ИСПРАВЛЕНО: Добавлен обратный слэш для экранирования точки.
-    error_text = "Формат неверный\\. Используйте только цифры и запятые\\. Например: `3,3,4`"
+    error_text = "Формат неверный\\. Используйте только цифры и запятые\\. Например: \\`3,3,4\\`"
     if not re.match(r'^\d+(,\s*\d+)*$', order):
         await update.message.reply_text(error_text, parse_mode="MarkdownV2")
         return AWAIT_SPLIT_ORDER
@@ -170,12 +184,14 @@ async def receive_split_order(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Порядок принят. Начинаю обработку...")
         return await split_file_handler(update, context, pre_saved=True)
     else:
-        await update.message.reply_text(f'Отлично, порядок "{order}" принят. Теперь отправьте PDF файл.')
+        safe_order = escape_markdown_v2(order)
+        await update.message.reply_text(f'Отлично, порядок "{safe_order}" принят. Теперь отправьте PDF файл.', parse_mode='MarkdownV2')
         context.user_data['awaiting_file_for'] = 'split'
         return AWAIT_SPLIT_FILE
 
 async def split_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, pre_saved: bool = False) -> int:
-    if pre_saved: document = context.user_data.get('file_to_split')
+    if pre_saved:
+        document = context.user_data.get('file_to_split')
     else:
         document = update.message.document
         await update.message.reply_text("Файл принят. Начинаю обработку...")
@@ -184,15 +200,19 @@ async def split_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE,
         file = await context.bot.get_file(document.file_id)
         file_bytes = await file.download_as_bytearray()
         pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-        total_pages = pdf_doc.page_count; ranges, mode = [], context.user_data.get('split_mode')
-        if mode == 'split_single': ranges = [[i] for i in range(total_pages)]
+        total_pages = pdf_doc.page_count
+        ranges, mode = [], context.user_data.get('split_mode')
+        if mode == 'split_single':
+            ranges = [[i] for i in range(total_pages)]
         elif mode == 'split_double':
             ranges = [[i, i + 1] for i in range(0, total_pages, 2)]
-            if total_pages % 2 != 0: ranges[-1] = [total_pages - 1]
+            if total_pages % 2 != 0:
+                ranges[-1] = [total_pages - 1]
         elif mode == 'split_custom':
             order, current_page = context.user_data.get('custom_order', []), 0
             for part_size in order:
-                if current_page >= total_pages: break
+                if current_page >= total_pages:
+                    break
                 end_page = min(current_page + part_size, total_pages)
                 ranges.append(list(range(current_page, end_page)))
                 current_page = end_page
@@ -204,11 +224,14 @@ async def split_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE,
             new_doc.close()
         pdf_doc.close()
     except Exception as e:
-        logger.error(f"Ошибка при разбивке PDF: {e}"); final_message = "К сожалению, при обработке файла произошла ошибка."
+        logger.error(f"Ошибка при разбивке PDF: {e}")
+        final_message = "К сожалению, при обработке файла произошла ошибка."
     return await return_to_main_menu(update, context, message=final_message)
 
 async def ask_for_combine_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer(); context.user_data.clear()
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
     context.user_data['files_to_process'] = []
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Все файлы отправлены", callback_data="process_done")], [InlineKeyboardButton("« Назад в главное меню", callback_data="main_menu")]])
     await query.edit_message_text("Поняла. Отправляйте мне PDF файлы для объединения. Когда закончите, нажмите кнопку.", reply_markup=keyboard)
@@ -216,20 +239,26 @@ async def ask_for_combine_files(update: Update, context: ContextTypes.DEFAULT_TY
     return AWAIT_COMBINE_FILES
 
 async def receive_file_for_list(update: Update, context: ContextTypes.DEFAULT_TYPE, next_state: int):
-    if 'files_to_process' not in context.user_data: context.user_data['files_to_process'] = []
-    document = update.message.document; context.user_data['files_to_process'].append(document)
+    if 'files_to_process' not in context.user_data:
+        context.user_data['files_to_process'] = []
+    document = update.message.document
+    context.user_data['files_to_process'].append(document)
     context.user_data['awaiting_file_for'] = 'combine' if next_state == AWAIT_COMBINE_FILES else 'assembly_unique'
-    await update.message.reply_text(f"Файл '{document.file_name}' добавлен ({len(context.user_data['files_to_process'])} всего).")
+    safe_name = escape_markdown_v2(document.file_name)
+    await update.message.reply_text(f"Файл '{safe_name}' добавлен ({len(context.user_data['files_to_process'])} всего).", parse_mode='MarkdownV2')
     return next_state
 
 async def combine_files_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, from_group: bool = False) -> int:
-    query = update.callback_query; await query.answer()
+    query = update.callback_query
+    await query.answer()
     documents = context.user_data.get('group_files_to_process') if from_group else context.user_data.get('files_to_process', [])
     if len(documents) < 2:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Нужно хотя бы два файла. Вы добавили {len(documents)}.")
         if not from_group:
-            context.user_data['awaiting_file_for'] = 'combine'; return AWAIT_COMBINE_FILES
-        else: return CHOOSE_ACTION
+            context.user_data['awaiting_file_for'] = 'combine'
+            return AWAIT_COMBINE_FILES
+        else:
+            return CHOOSE_ACTION
     await query.edit_message_text("Отлично! Начинаю объединение...")
     final_message = "Готово! Ваш объединенный файл."
     try:
@@ -237,28 +266,35 @@ async def combine_files_handler(update: Update, context: ContextTypes.DEFAULT_TY
         for doc in documents:
             file = await context.bot.get_file(doc.file_id)
             file_bytes = await file.download_as_bytearray()
-            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf"); result_doc.insert_pdf(pdf_doc); pdf_doc.close()
+            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+            result_doc.insert_pdf(pdf_doc)
+            pdf_doc.close()
         await context.bot.send_document(chat_id=update.effective_chat.id, document=result_doc.write(), filename="combined_document.pdf")
         result_doc.close()
     except Exception as e:
-        logger.error(f"Ошибка при объединении PDF: {e}"); final_message = "К сожалению, при обработке одного из файлов произошла ошибка."
+        logger.error(f"Ошибка при объединении PDF: {e}")
+        final_message = "К сожалению, при обработке одного из файлов произошла ошибка."
     return await return_to_main_menu(update, context, message=final_message)
 
 async def ask_for_assembly_common_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer(); context.user_data.clear()
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
     await query.edit_message_text("Хорошо. Сначала отправьте мне ОДИН общий PDF файл.")
     context.user_data['awaiting_file_for'] = 'assembly_common'
     return AWAIT_ASSEMBLY_COMMON
 
 async def receive_assembly_common_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['common_file'] = update.message.document; context.user_data['files_to_process'] = []
+    context.user_data['common_file'] = update.message.document
+    context.user_data['files_to_process'] = []
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Собрать файлы", callback_data="process_done")], [InlineKeyboardButton("« Назад в главное меню", callback_data="main_menu")]])
     await update.message.reply_text("Общий файл принят. Теперь отправляйте УНИКАЛЬНЫЕ PDF файлы.", reply_markup=keyboard)
     context.user_data['awaiting_file_for'] = 'assembly_unique'
     return AWAIT_ASSEMBLY_UNIQUE
 
 async def assembly_files_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer()
+    query = update.callback_query
+    await query.answer()
     unique_docs = context.user_data.get('files_to_process', [])
     common_doc_msg = context.user_data.get('common_file')
     if not unique_docs:
@@ -271,13 +307,17 @@ async def assembly_files_handler(update: Update, context: ContextTypes.DEFAULT_T
         common_file = await context.bot.get_file(common_doc_msg.file_id)
         common_file_bytes = await common_file.download_as_bytearray()
         for doc in unique_docs:
-            unique_file = await context.bot.get_file(doc.file_id); unique_file_bytes = await unique_file.download_as_bytearray()
-            result_doc = fitz.open(stream=unique_file_bytes, filetype="pdf"); common_pdf = fitz.open(stream=common_file_bytes, filetype="pdf")
-            result_doc.insert_pdf(common_pdf); common_pdf.close()
+            unique_file = await context.bot.get_file(doc.file_id)
+            unique_file_bytes = await unique_file.download_as_bytearray()
+            result_doc = fitz.open(stream=unique_file_bytes, filetype="pdf")
+            common_pdf = fitz.open(stream=common_file_bytes, filetype="pdf")
+            result_doc.insert_pdf(common_pdf)
+            common_pdf.close()
             await context.bot.send_document(chat_id=update.effective_chat.id, document=result_doc.write(), filename=f"assembled_{doc.file_name}")
             result_doc.close()
     except Exception as e:
-        logger.error(f"Ошибка при сборке PDF: {e}"); final_message = "К сожалению, при обработке одного из файлов произошла ошибка."
+        logger.error(f"Ошибка при сборке PDF: {e}")
+        final_message = "К сожалению, при обработке одного из файлов произошла ошибка."
     return await return_to_main_menu(update, context, message=final_message)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -285,7 +325,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     TOKEN = os.getenv("TELEGRAM_TOKEN")
-    if not TOKEN: raise ValueError("Необходимо установить переменную окружения TELEGRAM_TOKEN")
+    if not TOKEN:
+        raise ValueError("Необходимо установить переменную окружения TELEGRAM_TOKEN")
     application = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
