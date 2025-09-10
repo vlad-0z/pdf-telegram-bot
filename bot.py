@@ -68,9 +68,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.edit_message_text("Выберите, что вы хотите сделать:", reply_markup=MAIN_KEYBOARD)
     return CHOOSE_ACTION
 
-# ИСПРАВЛЕНИЕ: Ключевое изменение логики завершения.
 async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str) -> int:
-    """Завершает операцию и корректно возвращает в главное меню, сохраняя диалог активным."""
     context.user_data.clear()
     chat_id = update.effective_chat.id
     if update.callback_query:
@@ -78,13 +76,11 @@ async def return_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await context.bot.send_message(chat_id=chat_id, text=message)
     await context.bot.send_message(chat_id=chat_id, text="Чем еще могу помочь?", reply_markup=MAIN_KEYBOARD)
-    # Возвращаемся в начальное состояние, а не убиваем диалог
     return CHOOSE_ACTION
 
 # --- ЛОГИКА ОБРАБОТКИ ФАЙЛОВ ---
 
 async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает собранную группу файлов после задержки."""
     job_data = context.job.data
     media_group_id, chat_id, user_id, action = job_data['media_group_id'], job_data['chat_id'], job_data['user_id'], job_data['action']
     
@@ -103,7 +99,6 @@ async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Главный роутер для всех документов."""
     if update.message.media_group_id:
         media_group_id = update.message.media_group_id
         media_group_files[media_group_id].append(update.message.document)
@@ -143,16 +138,20 @@ async def ask_split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_split_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
     context.user_data['split_mode'] = query.data
+
+    # ИСПРАВЛЕНО: Добавлен обратный слэш для экранирования точки.
+    text_for_custom_order = "Хорошо\\. Отправьте порядок разбивки (например: `3,3,4`)"
+
     if 'file_to_split' in context.user_data:
         if query.data != 'split_custom':
             await query.edit_message_text("Поняла. Начинаю обработку...")
             return await split_file_handler(update, context, pre_saved=True)
         else:
-            await query.edit_message_text("Хорошо. Отправьте порядок разбивки (например: `3,3,4`)", parse_mode="MarkdownV2")
+            await query.edit_message_text(text_for_custom_order, parse_mode="MarkdownV2")
             return AWAIT_SPLIT_ORDER
     else:
         if query.data == 'split_custom':
-            await query.edit_message_text("Хорошо. Отправьте порядок разбивки (например: `3,3,4`)", parse_mode="MarkdownV2")
+            await query.edit_message_text(text_for_custom_order, parse_mode="MarkdownV2")
             return AWAIT_SPLIT_ORDER
         else:
             await query.edit_message_text("Поняла. Теперь просто отправьте мне PDF файл для разбивки.")
@@ -161,8 +160,10 @@ async def handle_split_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def receive_split_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     order = update.message.text
+    # ИСПРАВЛЕНО: Добавлен обратный слэш для экранирования точки.
+    error_text = "Формат неверный\\. Используйте только цифры и запятые\\. Например: `3,3,4`"
     if not re.match(r'^\d+(,\s*\d+)*$', order):
-        await update.message.reply_text("Формат неверный. Используйте только цифры и запятые. Например: `3,3,4`", parse_mode="MarkdownV2")
+        await update.message.reply_text(error_text, parse_mode="MarkdownV2")
         return AWAIT_SPLIT_ORDER
     context.user_data['custom_order'] = [int(x) for x in order.split(',')]
     if 'file_to_split' in context.user_data:
@@ -298,7 +299,6 @@ def main():
                 CallbackQueryHandler(ask_for_combine_files, pattern="^combine$"),
                 CallbackQueryHandler(ask_for_assembly_common_file, pattern="^assembly$"),
             ],
-            # ИСПРАВЛЕНИЕ: Добавляем сюда явный обработчик кнопки "Отмена" для надежности
             CHOOSE_SPLIT_MODE: [
                 CallbackQueryHandler(handle_split_choice, pattern="^split_(single|double|custom)$"),
                 CallbackQueryHandler(main_menu, pattern="^main_menu$"),
